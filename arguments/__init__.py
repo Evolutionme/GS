@@ -98,14 +98,17 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
         self.optimizer_type = "default"
         # Local features method hyperparameters
-        self.lambda_reg = 0.15
-        self.lambda_detail = 0.05
+        self.lambda_reg = 0.01
+        self.lambda_detail = 0.005
         self.mlp_lr = 0.0001
         self.stage1_iterations = 15_000
         self.knn_k = 8
-        self.knn_update_interval = 100
+        self.knn_update_interval = 1000
         self.grad_clip_norm = 1.0
         self.sigmoid_sharpness = 10.0
+        self.override_warmup_iters = 5000
+        self.prior_scale = 2.0
+        self.vis_buffer_size = 16
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

@@ -21,7 +21,7 @@ from utils.sh_utils import eval_sh, SH2RGB, RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-from utils.local_features import compute_knn, LocalFeatureExtractor, AdaptiveMLP
+from utils.local_features import compute_knn, LocalFeatureExtractor, GeometryAwareDecouplingRouter
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
@@ -69,12 +69,15 @@ class GaussianModel:
         # Local features module (opt-in)
         self.enable_local_features = enable_local_features
         if self.enable_local_features:
-            self.adaptive_mlp = AdaptiveMLP().cuda()
+            self.adaptive_mlp = GeometryAwareDecouplingRouter().cuda()
+            self.prior_scale = 2.0      # 先验 logit 映射强度
             self.knn_idx = None
             self.knn_update_iter = -1
             self.knn_k = 8
-            self.knn_update_interval = 100
+            self.knn_update_interval = 1000   # 100→1000
             self.sigmoid_sharpness = 10.0
+            self.visibility_buffer = None     # 多视角可见性缓冲
+            self.vis_buffer_size = 16         # 缓冲最近 16 个视角
 
     def capture(self):
         base = (
@@ -510,11 +513,27 @@ class GaussianModel:
 
     # ===== Local features methods (shadow-variable pattern) =====
 
+    def update_visibility_buffer(self, radii):
+        """每次迭代更新可见性缓冲区。"""
+        if not self.enable_local_features:
+            return
+        N = self.get_xyz.shape[0]
+        visible = (radii[:N] > 0).unsqueeze(1).float()  # (N, 1)
+        
+        if self.visibility_buffer is None or self.visibility_buffer.shape[0] != N:
+            self.visibility_buffer = visible  # 首次或高斯数量变化时重建
+        elif self.visibility_buffer.shape[1] < self.vis_buffer_size:
+            self.visibility_buffer = torch.cat([self.visibility_buffer, visible], dim=1)
+        else:
+            # 滑窗：丢弃最早的，追加最新的
+            self.visibility_buffer = torch.cat([self.visibility_buffer[:, 1:], visible], dim=1)
+
     def invalidate_knn_cache(self):
         """Force KNN cache refresh after Gaussian count changes."""
         if self.enable_local_features:
             self.knn_idx = None
             self.knn_update_iter = -1
+            self.visibility_buffer = None  # 新增：高斯数量变化时也清空可见性缓冲
 
     def get_knn_idx(self, iteration=None):
         """Get KNN indices, recomputing if necessary.
@@ -536,24 +555,27 @@ class GaussianModel:
         return self.knn_idx
 
     def compute_adaptive_alpha(self, iteration, viewpoint_cam):
-        """Compute adaptive coefficient alpha_i for each Gaussian.
-
-        Returns:
-            (N, 1) tensor of alpha values in [0, 1]
-        """
         xyz = self.get_xyz.detach()
         rotations = self._rotation.detach()
         scaling = self.get_scaling.detach()
         knn_idx = self.get_knn_idx(iteration)
 
-        # Compute 3D features
+        # 升级后的特征
         Si = LocalFeatureExtractor.compute_Si(xyz, rotations, scaling, knn_idx)
         Ui = LocalFeatureExtractor.compute_Ui(xyz, knn_idx)
-        Pi = LocalFeatureExtractor.compute_Pi(scaling, rotations, viewpoint_cam)
+        
+        # 多视角可见性方差（从缓冲区计算）
+        if self.visibility_buffer is not None and self.visibility_buffer.shape[1] >= 4:
+            Vi = LocalFeatureExtractor.compute_Vi(self.visibility_buffer)
+        else:
+            Vi = torch.full((xyz.shape[0], 1), 0.5, device=xyz.device)  # 缓冲不足时默认 0.5
 
-        # Stack features and pass through MLP
-        features = torch.cat([Si, Ui, Pi], dim=-1)  # (N, 3)
-        alpha_i = self.adaptive_mlp(features)  # (N, 1)
+        # 先验 logit：基于各向异性平面度
+        prior_logit = self.prior_scale * (Si - 0.5)  # (N, 1)
+
+        # GADR 预测残差修正
+        features = torch.cat([Si, Ui, Vi], dim=-1)   # (N, 3)
+        alpha_i, delta = self.adaptive_mlp(features, prior_logit)
         return alpha_i
 
     def get_adjusted_scaling_opacity(self, alpha_i, knn_idx):

@@ -85,44 +85,36 @@ class LocalFeatureExtractor:
 
     @staticmethod
     def compute_Si(xyz, rotations, scaling, knn_idx):
-        """Compute plane similarity feature Si.
-
-        Normal direction = rotation matrix column corresponding to the smallest scaling axis.
-        Si = 1 - Var(neighbor_angles) / (pi/2)
-
-        Args:
-            xyz: (N, 3) positions
-            rotations: (N, 4) quaternions
-            scaling: (N, 3) activated scaling values
-            knn_idx: (N, k) neighbor indices
-
-        Returns:
-            (N, 1) Si values in [0, 1]
+        """各向异性平面度特征 S_hat_i。
+        
+        计算邻域高斯中心的 3×3 协方差矩阵，做特征分解，
+        用 planarity = (λ2 - λ3) / λ1 衡量局部几何的平面程度。
+        
+        - S_hat_i → 1：邻域点分布在一个平面上（λ3 ≈ 0）
+        - S_hat_i → 0：邻域点各向同性分布或线性分布
         """
         N = xyz.shape[0]
-        # Build rotation matrices
-        R = quaternion_to_rotation_matrix(rotations)  # (N, 3, 3)
-
-        # Extract normal as the column corresponding to the smallest scaling axis
-        min_scale_idx = scaling.argmin(dim=1)  # (N,)
-        normals = R[torch.arange(N, device=R.device), :, min_scale_idx]  # (N, 3)
-        normals = torch.nn.functional.normalize(normals, dim=-1)
-
-        # Get neighbor normals
-        neighbor_normals = normals[knn_idx]  # (N, k, 3)
-
-        # Compute angles between each point's normal and its neighbors' normals
-        # cos_angle = |dot(n_i, n_j)| (absolute value because normals can be flipped)
-        cos_angles = torch.abs(
-            (normals.unsqueeze(1) * neighbor_normals).sum(dim=-1)
-        ).clamp(0.0, 1.0)  # (N, k)
-        angles = torch.acos(cos_angles.clamp(max=1.0 - 1e-6))  # (N, k) in [0, pi/2]
-
-        # Variance of angles
-        angle_var = angles.var(dim=1, keepdim=True)  # (N, 1)
-
-        # Si = 1 - Var(angle) / (pi/2)
-        Si = (1.0 - angle_var / (math.pi / 2.0)).clamp(0.0, 1.0)
+        
+        # 获取邻域坐标
+        neighbor_xyz = xyz[knn_idx]                          # (N, k, 3)
+        
+        # 中心化：减去邻域中心
+        center = neighbor_xyz.mean(dim=1, keepdim=True)      # (N, 1, 3)
+        centered = neighbor_xyz - center                     # (N, k, 3)
+        
+        # 计算 3×3 协方差矩阵: C = (1/k) * X^T X
+        cov = torch.bmm(centered.transpose(1, 2), centered)  # (N, 3, 3)
+        cov = cov / knn_idx.shape[1]
+        
+        # 特征分解（对称矩阵，用 symeig/linalg.eigh）
+        eigenvalues, _ = torch.linalg.eigh(cov)              # (N, 3), 升序
+        # eigh 返回升序：λ_small, λ_mid, λ_large
+        lam3 = eigenvalues[:, 0].clamp(min=1e-8)   # λ3 (最小)
+        lam2 = eigenvalues[:, 1].clamp(min=1e-8)   # λ2 (中间)
+        lam1 = eigenvalues[:, 2].clamp(min=1e-8)   # λ1 (最大)
+        
+        # 平面度: planarity = (λ2 - λ3) / λ1
+        Si = ((lam2 - lam3) / lam1).clamp(0.0, 1.0).unsqueeze(-1)  # (N, 1)
         return Si
 
     @staticmethod
@@ -158,71 +150,81 @@ class LocalFeatureExtractor:
         return Ui
 
     @staticmethod
-    def compute_Pi(scaling, rotations, viewpoint_camera):
-        """Compute projection pixel ratio feature Pi.
-
-        Estimates the 2D projected area of each Gaussian and normalizes by the average.
-
+    def compute_Vi(visibility_history):
+        """多视角可见性方差 V_i。
+        
+        衡量高斯在最近 K 个视角下可见性的一致程度。
+        
+        - V_i → 0：可见性稳定（全可见或全不可见），通常是平面内部
+        - V_i → 1：可见性不稳定（某些视角可见某些不可见），通常是边缘/遮挡处
+        
         Args:
-            scaling: (N, 3) activated scaling values
-            rotations: (N, 4) quaternions
-            viewpoint_camera: camera object with FoVx, FoVy, image_width, image_height, etc.
-
+            visibility_history: (N, K) tensor, 0/1 值，最近 K 个视角的可见性
+    
         Returns:
-            (N, 1) Pi values in [0, 1]
+            (N, 1) Vi values in [0, 1]
         """
-        # Approximate 2D projected area:
-        # Use the two largest scaling axes (the "disk" area of the ellipsoid)
-        # Sort scaling to get the two largest
-        sorted_scales, _ = scaling.sort(dim=-1, descending=True)
-        # Approximate ellipse area = pi * s1 * s2
-        area_3d = math.pi * sorted_scales[:, 0] * sorted_scales[:, 1]  # (N,)
-
-        # Rough projection scaling factor based on focal length
-        fx = viewpoint_camera.image_width / (2.0 * math.tan(viewpoint_camera.FoVx * 0.5))
-        fy = viewpoint_camera.image_height / (2.0 * math.tan(viewpoint_camera.FoVy * 0.5))
-        focal_scale = (fx * fy)  # scalar
-
-        # Projected pixel area (rough estimate, ignoring depth for simplicity)
-        pixel_area = area_3d * focal_scale  # (N,)
-
-        # Normalize by mean
-        mean_area = pixel_area.mean().clamp(min=1e-6)
-        Pi = (pixel_area / mean_area).unsqueeze(-1).clamp(0.0, 1.0)  # (N, 1)
-        return Pi
+        # Bernoulli 方差 = p * (1 - p)，最大值 0.25
+        mean_vis = visibility_history.float().mean(dim=1, keepdim=True)   # (N, 1)
+        Vi = (mean_vis * (1.0 - mean_vis) * 4.0).clamp(0.0, 1.0)        # 归一化到 [0,1]
+        return Vi
 
 
-class AdaptiveMLP(nn.Module):
-    """Lightweight MLP: 3 -> 16 -> 8 -> 1 with ReLU + Sigmoid.
-
-    Total parameters: (3*16+16) + (16*8+8) + (8*1+1) = 64 + 136 + 9 = 209
+class GeometryAwareDecouplingRouter(nn.Module):
+    """几何感知解耦路由网络 (GADR)。
+    
+    输入 3 维特征 [S_hat_i, Ui, Vi]，通道注意力加权后，
+    预测对物理先验的残差修正 δ。
+    
+    alpha_i = Sigmoid(prior_logit + delta)
+    
+    近零初始化确保初始 delta ≈ 0 → alpha ≈ Sigmoid(prior)。
+    
+    参数量: 注意力(32+27=59) + 残差网络(64+136+9=209) = 268
     """
 
     def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
+        # 通道注意力：学习 Si/Ui/Vi 的相对重要性
+        self.channel_attention = nn.Sequential(
+            nn.Linear(3, 8),
+            nn.ReLU(inplace=True),
+            nn.Linear(8, 3),
+            nn.Sigmoid()
+        )
+        # 残差预测网络
+        self.residual_net = nn.Sequential(
             nn.Linear(3, 16),
             nn.ReLU(inplace=True),
             nn.Linear(16, 8),
             nn.ReLU(inplace=True),
-            nn.Linear(8, 1),
-            nn.Sigmoid()
+            nn.Linear(8, 1)   # raw delta，不加 Sigmoid
         )
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights with small values for stable training start."""
-        for m in self.net:
+        for m in self.channel_attention:
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                nn.init.zeros_(m.bias)
+        # 残差分支极小初始化 → 初始 delta ≈ 0
+        for m in self.residual_net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.01)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, features):
+    def forward(self, features, prior_logit):
         """
         Args:
-            features: (N, 3) tensor of [Si, Ui, Pi]
+            features: (N, 3) [S_hat_i, Ui, Vi]
+            prior_logit: (N, 1) heuristic prior in logit space
 
         Returns:
-            (N, 1) alpha_i values in [0, 1]
+            alpha: (N, 1) in [0, 1]
+            delta: (N, 1) residual for monitoring
         """
-        return self.net(features)
+        att_weights = self.channel_attention(features)    # (N, 3)
+        attended = features * att_weights                 # (N, 3)
+        delta = self.residual_net(attended)               # (N, 1)
+        alpha = torch.sigmoid(prior_logit + delta)        # (N, 1)
+        return alpha, delta

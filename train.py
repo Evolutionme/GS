@@ -123,6 +123,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             alpha_i = gaussians.compute_adaptive_alpha(iteration, viewpoint_cam)
             knn_idx = gaussians.get_knn_idx(iteration)
 
+            # Warmup：override 强度线性增长 0→1
+            stage2_step = iteration - opt.stage1_iterations
+            warmup_iters = getattr(opt, 'override_warmup_iters', 5000)
+            if getattr(args_extra, 'no_warmup', False):
+                warmup_factor = 1.0
+            else:
+                warmup_factor = min(1.0, stage2_step / warmup_iters)
+
             if getattr(args_extra, 'no_feature', False):
                 # Ablation B: fixed alpha = 0.5
                 alpha_i = torch.full_like(alpha_i, 0.5)
@@ -131,6 +139,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 alpha_i = alpha_i.detach()  # No MLP gradient
 
             override_scaling, override_opacity = gaussians.get_adjusted_scaling_opacity(alpha_i, knn_idx)
+            
+            # 混合：warmup_factor=0 时用原始值，=1 时用调整值
+            if warmup_factor < 1.0:
+                orig_s = gaussians.get_scaling
+                orig_o = gaussians.get_opacity
+                override_scaling = orig_s + warmup_factor * (override_scaling - orig_s)
+                override_opacity = orig_o + warmup_factor * (override_opacity - orig_o)
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg,
                             use_trained_exp=dataset.train_test_exp,
@@ -138,6 +153,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             override_scaling=override_scaling,
                             override_opacity=override_opacity)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+        # 更新可见性缓冲（全程运行，为 stage2 积累数据）
+        gaussians.update_visibility_buffer(radii)
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
@@ -329,12 +347,13 @@ if __name__ == "__main__":
     parser.add_argument('--no_reg_loss', action='store_true', default=False)
     parser.add_argument('--no_detail_loss', action='store_true', default=False)
     parser.add_argument('--no_two_stage', action='store_true', default=False)
+    parser.add_argument('--no_warmup', action='store_true', default=False)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
     # Validate ablation switches
     if not args.enable_local_features:
-        for flag in ['no_feature', 'no_mlp', 'no_reg_loss', 'no_detail_loss', 'no_two_stage']:
+        for flag in ['no_feature', 'no_mlp', 'no_reg_loss', 'no_detail_loss', 'no_two_stage', 'no_warmup']:
             if getattr(args, flag):
                 print(f"WARNING: --{flag} has no effect without --enable_local_features")
     
