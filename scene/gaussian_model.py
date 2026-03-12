@@ -17,10 +17,11 @@ import os
 import json
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
-from utils.sh_utils import RGB2SH
+from utils.sh_utils import eval_sh, SH2RGB, RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.local_features import compute_knn, LocalFeatureExtractor, AdaptiveMLP
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
@@ -47,7 +48,7 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree, optimizer_type="default"):
+    def __init__(self, sh_degree, optimizer_type="default", enable_local_features=False):
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
@@ -65,8 +66,18 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
 
+        # Local features module (opt-in)
+        self.enable_local_features = enable_local_features
+        if self.enable_local_features:
+            self.adaptive_mlp = AdaptiveMLP().cuda()
+            self.knn_idx = None
+            self.knn_update_iter = -1
+            self.knn_k = 8
+            self.knn_update_interval = 100
+            self.sigmoid_sharpness = 10.0
+
     def capture(self):
-        return (
+        base = (
             self.active_sh_degree,
             self._xyz,
             self._features_dc,
@@ -80,8 +91,17 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
+        if self.enable_local_features:
+            return base + (self.adaptive_mlp.state_dict(),)
+        return base
     
     def restore(self, model_args, training_args):
+        if self.enable_local_features and len(model_args) > 12:
+            base_args = model_args[:12]
+            mlp_state = model_args[12]
+        else:
+            base_args = model_args[:12]
+            mlp_state = None
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -93,11 +113,13 @@ class GaussianModel:
         xyz_gradient_accum, 
         denom,
         opt_dict, 
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale) = base_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        if self.enable_local_features and mlp_state is not None:
+            self.adaptive_mlp.load_state_dict(mlp_state)
 
     @property
     def get_scaling(self):
@@ -210,6 +232,15 @@ class GaussianModel:
                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
                                                         max_steps=training_args.iterations)
 
+        # MLP optimizer (only when local features are enabled)
+        if self.enable_local_features:
+            mlp_lr = getattr(training_args, 'mlp_lr', 1e-4)
+            self.mlp_optimizer = torch.optim.Adam(self.adaptive_mlp.parameters(), lr=mlp_lr)
+            # Store hyperparams from training_args if available
+            self.knn_k = getattr(training_args, 'knn_k', 8)
+            self.knn_update_interval = getattr(training_args, 'knn_update_interval', 100)
+            self.sigmoid_sharpness = getattr(training_args, 'sigmoid_sharpness', 10.0)
+
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         if self.pretrained_exposures is None:
@@ -318,12 +349,15 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             if group["name"] == name:
                 stored_state = self.optimizer.state.get(group['params'][0], None)
-                stored_state["exp_avg"] = torch.zeros_like(tensor)
-                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+                if stored_state is not None:
+                    stored_state["exp_avg"] = torch.zeros_like(tensor)
+                    stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
 
-                del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
-                self.optimizer.state[group['params'][0]] = stored_state
+                    del self.optimizer.state[group['params'][0]]
+                    group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+                    self.optimizer.state[group['params'][0]] = stored_state
+                else:
+                    group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
 
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
@@ -362,6 +396,7 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
+        self.invalidate_knn_cache()
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -405,6 +440,7 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.invalidate_knn_cache()
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -471,3 +507,81 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    # ===== Local features methods (shadow-variable pattern) =====
+
+    def invalidate_knn_cache(self):
+        """Force KNN cache refresh after Gaussian count changes."""
+        if self.enable_local_features:
+            self.knn_idx = None
+            self.knn_update_iter = -1
+
+    def get_knn_idx(self, iteration=None):
+        """Get KNN indices, recomputing if necessary.
+        
+        Triggers recomputation when:
+        1. knn_idx is None (first time or invalidated)
+        2. Shape mismatch with current Gaussian count
+        3. Exceeded knn_update_interval since last update
+        """
+        N = self.get_xyz.shape[0]
+        need_update = (
+            self.knn_idx is None
+            or self.knn_idx.shape[0] != N
+            or (iteration is not None and iteration - self.knn_update_iter >= self.knn_update_interval)
+        )
+        if need_update:
+            self.knn_idx = compute_knn(self.get_xyz.detach(), k=self.knn_k)
+            self.knn_update_iter = iteration if iteration is not None else -1
+        return self.knn_idx
+
+    def compute_adaptive_alpha(self, iteration, viewpoint_cam):
+        """Compute adaptive coefficient alpha_i for each Gaussian.
+
+        Returns:
+            (N, 1) tensor of alpha values in [0, 1]
+        """
+        xyz = self.get_xyz.detach()
+        rotations = self._rotation.detach()
+        scaling = self.get_scaling.detach()
+        knn_idx = self.get_knn_idx(iteration)
+
+        # Compute 3D features
+        Si = LocalFeatureExtractor.compute_Si(xyz, rotations, scaling, knn_idx)
+        Ui = LocalFeatureExtractor.compute_Ui(xyz, knn_idx)
+        Pi = LocalFeatureExtractor.compute_Pi(scaling, rotations, viewpoint_cam)
+
+        # Stack features and pass through MLP
+        features = torch.cat([Si, Ui, Pi], dim=-1)  # (N, 3)
+        alpha_i = self.adaptive_mlp(features)  # (N, 1)
+        return alpha_i
+
+    def get_adjusted_scaling_opacity(self, alpha_i, knn_idx):
+        """Shadow-variable pattern: compute adjusted values without modifying originals.
+
+        Uses soft sigmoid weighting (not hard mask) for differentiability.
+        NEVER modifies self._scaling or self._opacity.
+
+        Returns:
+            adjusted_scaling: (N, 3) temporary tensor
+            adjusted_opacity: (N, 1) temporary tensor
+        """
+        orig_scaling = self.get_scaling     # Read-only
+        orig_opacity = self.get_opacity     # Read-only
+
+        # Soft weight: sigmoid instead of hard threshold
+        w_plane = torch.sigmoid(self.sigmoid_sharpness * (alpha_i - 0.5))  # (N, 1)
+        w_detail = 1.0 - w_plane
+
+        # Scaling adjustment: blend toward neighbor mean
+        neighbor_scaling = orig_scaling[knn_idx].mean(dim=1)  # (N, 3)
+        adjusted_scaling = (
+            orig_scaling * (1 - w_plane * alpha_i)
+            + neighbor_scaling * (w_plane * alpha_i)
+        )
+
+        # Opacity adjustment: boost for detail regions
+        opacity_boost = w_detail * (1 - 2 * alpha_i) * 0.1
+        adjusted_opacity = torch.clamp(orig_opacity + opacity_boost, 0.0, 0.999)
+
+        return adjusted_scaling, adjusted_opacity

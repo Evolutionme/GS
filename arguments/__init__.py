@@ -97,6 +97,15 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        # Local features method hyperparameters
+        self.lambda_reg = 0.15
+        self.lambda_detail = 0.05
+        self.mlp_lr = 0.0001
+        self.stage1_iterations = 15_000
+        self.knn_k = 8
+        self.knn_update_interval = 100
+        self.grad_clip_norm = 1.0
+        self.sigmoid_sharpness = 10.0
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

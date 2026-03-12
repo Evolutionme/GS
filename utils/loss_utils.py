@@ -89,3 +89,63 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
 def fast_ssim(img1, img2):
     ssim_map = FusedSSIMMap.apply(C1, C2, img1, img2)
     return ssim_map.mean()
+
+
+def regularization_loss(xyz, knn_idx, alpha_i, sigmoid_sharpness=10.0):
+    """L_Reg: Encourage uniform spacing in plane regions (high alpha).
+
+    For Gaussians with high alpha_i (plane-like), penalize non-uniform 
+    neighbor distances to promote smooth surfaces.
+
+    Args:
+        xyz: (N, 3) Gaussian positions
+        knn_idx: (N, k) neighbor indices
+        alpha_i: (N, 1) adaptive coefficients
+        sigmoid_sharpness: sharpness of the soft weight
+
+    Returns:
+        scalar loss value
+    """
+    # Soft weight for plane regions
+    w_plane = torch.sigmoid(sigmoid_sharpness * (alpha_i - 0.5))  # (N, 1)
+
+    # Compute neighbor distances
+    neighbor_xyz = xyz[knn_idx]  # (N, k, 3)
+    dists = torch.norm(neighbor_xyz - xyz.unsqueeze(1), dim=-1)  # (N, k)
+
+    # Standard deviation of distances (want this to be small for planes)
+    dist_std = dists.std(dim=1, keepdim=True)  # (N, 1)
+
+    # Weighted loss: only penalize plane regions
+    loss = (w_plane * dist_std).mean()
+    return loss
+
+
+def detail_loss(xyz, knn_idx, alpha_i, sigmoid_sharpness=10.0):
+    """L_Detail: Encourage tight clustering in detail regions (low alpha).
+
+    For Gaussians with low alpha_i (detail-like), penalize distance
+    to neighborhood center to keep detail Gaussians clustered.
+
+    Args:
+        xyz: (N, 3) Gaussian positions
+        knn_idx: (N, k) neighbor indices
+        alpha_i: (N, 1) adaptive coefficients
+        sigmoid_sharpness: sharpness of the soft weight
+
+    Returns:
+        scalar loss value
+    """
+    # Soft weight for detail regions
+    w_detail = 1.0 - torch.sigmoid(sigmoid_sharpness * (alpha_i - 0.5))  # (N, 1)
+
+    # Compute neighborhood center
+    neighbor_xyz = xyz[knn_idx]  # (N, k, 3)
+    center = neighbor_xyz.mean(dim=1)  # (N, 3)
+
+    # Distance from each Gaussian to its neighborhood center
+    dist_to_center = torch.norm(xyz - center, dim=-1, keepdim=True)  # (N, 1)
+
+    # Weighted loss: only penalize detail regions
+    loss = (w_detail * dist_to_center).mean()
+    return loss

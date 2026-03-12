@@ -12,7 +12,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, ssim, regularization_loss, detail_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -40,14 +40,15 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args_extra=None):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type,
+                              enable_local_features=getattr(args_extra, 'enable_local_features', False) if args_extra else False)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -108,7 +109,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        # === Shadow variables: compute adjusted scaling/opacity (stage 2 only) ===
+        override_scaling = None
+        override_opacity = None
+        alpha_i = None
+        knn_idx = None
+        is_stage2 = (
+            gaussians.enable_local_features
+            and iteration > opt.stage1_iterations
+            and (not getattr(args_extra, 'no_feature', False) or not getattr(args_extra, 'no_mlp', False))
+        )
+        if is_stage2:
+            alpha_i = gaussians.compute_adaptive_alpha(iteration, viewpoint_cam)
+            knn_idx = gaussians.get_knn_idx(iteration)
+
+            if getattr(args_extra, 'no_feature', False):
+                # Ablation B: fixed alpha = 0.5
+                alpha_i = torch.full_like(alpha_i, 0.5)
+            elif getattr(args_extra, 'no_mlp', False):
+                # Ablation C: hard rules based on Si threshold
+                alpha_i = alpha_i.detach()  # No MLP gradient
+
+            override_scaling, override_opacity = gaussians.get_adjusted_scaling_opacity(alpha_i, knn_idx)
+
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg,
+                            use_trained_exp=dataset.train_test_exp,
+                            separate_sh=SPARSE_ADAM_AVAILABLE,
+                            override_scaling=override_scaling,
+                            override_opacity=override_opacity)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -124,6 +152,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ssim_value = ssim(image, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+        # === Additive new losses (stage 2 only) ===
+        Ll1reg = 0.0
+        Ll1detail = 0.0
+        if is_stage2 and alpha_i is not None and knn_idx is not None:
+            xyz_detached = gaussians.get_xyz.detach()
+            if not getattr(args_extra, 'no_reg_loss', False):
+                Ll1reg = regularization_loss(xyz_detached, knn_idx, alpha_i, opt.sigmoid_sharpness)
+                loss = loss + opt.lambda_reg * Ll1reg
+            if not getattr(args_extra, 'no_detail_loss', False):
+                Ll1detail = detail_loss(xyz_detached, knn_idx, alpha_i, opt.sigmoid_sharpness)
+                loss = loss + opt.lambda_detail * Ll1detail
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -184,6 +224,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
+
+                # MLP optimizer step (stage 2 only)
+                if gaussians.enable_local_features and iteration > opt.stage1_iterations:
+                    # Gradient clipping for MLP
+                    torch.nn.utils.clip_grad_norm_(gaussians.adaptive_mlp.parameters(), opt.grad_clip_norm)
+                    gaussians.mlp_optimizer.step()
+                    gaussians.mlp_optimizer.zero_grad(set_to_none=True)
+
+            # Gaussian count and alpha distribution logging
+            if iteration % 1000 == 0:
+                if tb_writer:
+                    tb_writer.add_scalar('stats/num_gaussians', gaussians.get_xyz.shape[0], iteration)
+                if (gaussians.enable_local_features and iteration > opt.stage1_iterations
+                    and tb_writer and alpha_i is not None):
+                    tb_writer.add_histogram('stats/alpha_distribution', alpha_i.detach().cpu(), iteration)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -267,8 +322,21 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    # Local features master switch and ablation sub-switches
+    parser.add_argument('--enable_local_features', action='store_true', default=False)
+    parser.add_argument('--no_feature', action='store_true', default=False)
+    parser.add_argument('--no_mlp', action='store_true', default=False)
+    parser.add_argument('--no_reg_loss', action='store_true', default=False)
+    parser.add_argument('--no_detail_loss', action='store_true', default=False)
+    parser.add_argument('--no_two_stage', action='store_true', default=False)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
+    
+    # Validate ablation switches
+    if not args.enable_local_features:
+        for flag in ['no_feature', 'no_mlp', 'no_reg_loss', 'no_detail_loss', 'no_two_stage']:
+            if getattr(args, flag):
+                print(f"WARNING: --{flag} has no effect without --enable_local_features")
     
     print("Optimizing " + args.model_path)
 
@@ -279,7 +347,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
 
     # All done
     print("\nTraining complete.")
