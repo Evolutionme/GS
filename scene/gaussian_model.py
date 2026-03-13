@@ -270,15 +270,41 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         return l
 
-    def save_ply(self, path):
+    def save_ply(self, path, iteration=None, opt=None):
         mkdir_p(os.path.dirname(path))
 
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        opacities = self._opacity.detach().cpu().numpy()
-        scale = self._scaling.detach().cpu().numpy()
+        
+        if self.enable_local_features:
+            alpha_i = self.compute_adaptive_alpha(iteration=iteration, viewpoint_cam=None)
+            knn_idx = self.get_knn_idx(iteration=iteration)
+            adj_scaling, adj_opacity = self.get_adjusted_scaling_opacity(alpha_i, knn_idx)
+            
+            if iteration is not None and opt is not None and iteration > opt.stage1_iterations:
+                stage2_step = iteration - opt.stage1_iterations
+                warmup_iters = getattr(opt, 'override_warmup_iters', 5000)
+                warmup_factor = min(1.0, stage2_step / warmup_iters)
+                
+                if warmup_factor < 1.0:
+                    orig_s = self.get_scaling
+                    orig_o = self.get_opacity
+                    adj_scaling = orig_s + warmup_factor * (adj_scaling - orig_s)
+                    adj_opacity = orig_o + warmup_factor * (adj_opacity - orig_o)
+                    
+            elif iteration is not None and opt is not None and iteration <= opt.stage1_iterations:
+                # If local features are enabled but we are before stage 1 ends, no overrides are applied
+                adj_scaling = self.get_scaling
+                adj_opacity = self.get_opacity
+            
+            scale = self.scaling_inverse_activation(adj_scaling).detach().cpu().numpy()
+            opacities = self.inverse_opacity_activation(adj_opacity).detach().cpu().numpy()
+        else:
+            opacities = self._opacity.detach().cpu().numpy()
+            scale = self._scaling.detach().cpu().numpy()
+            
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
